@@ -20,7 +20,9 @@ import {
 import {
 	aesDecryptCTR,
 	aesEncryptGCM,
+	baileysLog,
 	cleanMessage,
+	createPreKeyCircuitBreaker,
 	Curve,
 	decodeMediaRetryNode,
 	decodeMessageNode,
@@ -34,6 +36,7 @@ import {
 	getNextPreKeys,
 	getStatusFromReceiptType,
 	hkdf,
+	logMessage,
 	MISSING_KEYS_ERROR_TEXT,
 	NACK_REASONS,
 	NO_MESSAGE_FOUND_ERROR_TEXT,
@@ -85,6 +88,23 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 	/** this mutex ensures that each retryRequest will wait for the previous one to finish */
 	const retryMutex = makeMutex()
+
+	/** Circuit breaker to prevent PreKey error loops */
+	const prekeyCircuitBreaker = createPreKeyCircuitBreaker(logger)
+
+	// Log initialization (controlled by BAILEYS_LOG environment variable)
+	baileysLog('🔧 Circuit Breaker initialized - Threshold: 5 failures/60s, Timeout: 30s')
+
+	logger.warn(
+		{
+				component: 'CircuitBreaker',
+			failureThreshold: 5,
+			failureWindow: '60s',
+			openTimeout: '30s',
+			successThreshold: 2
+		},
+		'🔧 Circuit Breaker initialized for PreKey error protection'
+	)
 
 	const msgRetryCache =
 		config.msgRetryCounterCache ||
@@ -252,7 +272,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 			await sendNode(receipt)
 
-			logger.info({ msgAttrs: node.attrs, retryCount }, 'sent retry receipt')
+			logger.warn({ msgAttrs: node.attrs, retryCount }, 'sent retry receipt')
 		})
 	}
 
@@ -270,11 +290,11 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		} else {
 			const identityNode = getBinaryNodeChild(node, 'identity')
 			if (identityNode) {
-				logger.info({ jid: from }, 'identity changed')
+				logger.warn({ jid: from }, 'identity changed')
 				// not handling right now
 				// signal will override new identity anyway
 			} else {
-				logger.info({ node }, 'unknown encrypt notification')
+				logger.warn({ node }, 'unknown encrypt notification')
 			}
 		}
 	}
@@ -431,7 +451,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				const devices = getBinaryNodeChildren(child, 'device')
 				if (areJidsSameUser(child.attrs.jid, authState.creds.me!.id)) {
 					const deviceJids = devices.map(d => d.attrs.jid)
-					logger.info({ deviceJids }, 'got my own devices')
+					logger.warn({ deviceJids }, 'got my own devices')
 				}
 
 				break
@@ -475,7 +495,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 					const newDuration = +child.attrs.duration
 					const timestamp = +child.attrs.t
 
-					logger.info({ newDuration }, 'updated account disappearing mode')
+					logger.warn({ newDuration }, 'updated account disappearing mode')
 
 					ev.emit('creds.update', {
 						accountSettings: {
@@ -713,10 +733,10 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 									logger.error({ key, ids, trace: error.stack }, 'error in sending message again')
 								}
 							} else {
-								logger.info({ attrs, key }, 'recv retry for not fromMe message')
+								logger.warn({ attrs, key }, 'recv retry for not fromMe message')
 							}
 						} else {
-							logger.info({ attrs, key }, 'will not send message again, as sent too many times')
+							logger.warn({ attrs, key }, 'will not send message again, as sent too many times')
 						}
 					}
 				})
@@ -839,10 +859,77 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 									return
 								}
 
+								// Check circuit breaker before attempting retry
+								if (!prekeyCircuitBreaker.canExecute()) {
+									const stats = prekeyCircuitBreaker.getStats()
+									baileysLog(`🔴 Circuit Breaker OPEN - Blocking retry. State: ${stats.state}, Wait: ${Math.round(stats.timeUntilHalfOpen/1000)}s`)
+									logger.warn(
+										{
+											msgId: msg.key.id,
+											circuitState: stats.state,
+											timeUntilHalfOpen: stats.timeUntilHalfOpen
+										},
+										'Circuit breaker is open - skipping retry to prevent loop'
+									)
+									return
+								}
+
 								const encNode = getBinaryNodeChild(node, 'enc')
-								await sendRetryRequest(node, true)
-								if (retryRequestDelayMs) {
-									await delay(retryRequestDelayMs)
+
+								try {
+									// Get current retry count for exponential backoff
+									const msgKey = msg.key
+									const msgId = msgKey.id!
+									const key = `${msgId}:${msgKey?.participant}`
+									const retryCount = msgRetryCache.get<number>(key) || 0
+									const maxRetries = 5
+
+									// Log decrypt failed with retry count (controlled by BAILEYS_LOG environment variable)
+									logMessage('decrypt_failed', { messageId: msgId, retryCount: retryCount + 1, maxRetries })
+
+									// Exponential backoff: 1s, 2s, 5s, 10s, 20s
+									const backoffDelays = [1000, 2000, 5000, 10000, 20000]
+									const backoffDelay = backoffDelays[Math.min(retryCount, backoffDelays.length - 1)]
+
+									if (retryCount > 0) {
+										logger.debug(
+											{ msgId, retryCount, backoffDelay },
+											'Applying exponential backoff before retry'
+										)
+										await delay(backoffDelay)
+									}
+
+									await sendRetryRequest(node, true)
+
+									// Record success in circuit breaker
+									prekeyCircuitBreaker.recordSuccess()
+
+									const cbStats = prekeyCircuitBreaker.getStats()
+
+									// Log retry success (controlled by BAILEYS_LOG environment variable)
+									baileysLog(`✅ Message retry successful - CB State: ${cbStats.state}, Failures: ${cbStats.failures}, RetryCount: ${retryCount}`)
+									logger.warn(
+										{
+											component: 'CircuitBreaker',
+											msgId,
+											retryCount,
+											circuitBreakerState: cbStats.state,
+											cbFailures: cbStats.failures
+										},
+										'✅ Message retry successful - Circuit Breaker healthy'
+									)
+
+									if (retryRequestDelayMs) {
+										await delay(retryRequestDelayMs)
+									}
+								} catch (err) {
+									// Record failure in circuit breaker
+									logger.error(
+										{ msgId: msg.key.id, error: err.message },
+										'Retry request failed'
+									)
+									prekeyCircuitBreaker.recordFailure(err)
+									throw err
 								}
 							} else {
 								logger.debug({ node }, 'connection closed, ignoring retry req')
@@ -1013,7 +1100,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		// // it means -- the message hasn't reached all devices yet
 		// // we'll retry sending the message here
 		// if(attrs.phash) {
-		// 	logger.info({ attrs }, 'received phash in ack, resending message...')
+		// 	logger.warn({ attrs }, 'received phash in ack, resending message...')
 		// 	const msg = await getMessage(key)
 		// 	if(msg) {
 		// 		await relayMessage(key.remoteJid!, msg, { messageId: key.id!, useUserDevicesCache: false })
@@ -1129,7 +1216,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		const [child] = getAllBinaryNodeChildren(node)
 		const author = node.attrs.participant
 
-		logger.info({ from, child }, 'got newsletter notification')
+		logger.warn({ from, child }, 'got newsletter notification')
 
 		switch (child.tag) {
 			case 'reaction':
@@ -1201,7 +1288,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 							messageTimestamp: +child.attrs.t
 						})
 						await upsertMessage(fullMessage, 'append')
-						logger.info('Processed plaintext newsletter message')
+						logger.warn('Processed plaintext newsletter message')
 					} catch (error) {
 						logger.error({ error }, 'Failed to decode plaintext newsletter message')
 					}
@@ -1239,7 +1326,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			return
 		}
 
-		logger.info({ operation, updates }, 'got mex newsletter notification')
+		logger.warn({ operation, updates }, 'got mex newsletter notification')
 
 		switch (operation) {
 			case 'NotificationNewsletterUpdate':
@@ -1270,7 +1357,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				break
 
 			default:
-				logger.info({ operation, data }, 'Unhandled mex newsletter notification')
+				logger.warn({ operation, data }, 'Unhandled mex newsletter notification')
 				break
 		}
 	}

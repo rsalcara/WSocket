@@ -26,6 +26,8 @@ import {
 	getStatusCodeForMediaRetry,
 	getUrlFromDirectPath,
 	getWAUploadToServer,
+	logMessage,
+	logSession,
 	normalizeMessageContent,
 	parseAndInjectE2ESessions,
 	unixTimestampSeconds,
@@ -289,6 +291,11 @@ const lidCache = new NodeCache({
 				]
 			})
 			await parseAndInjectE2ESessions(result, signalRepository, lids, meid, melid)
+
+			// Log session establishment for each contact (controlled by BAILEYS_LOG environment variable)
+			for (const jid of jidsRequiringFetch) {
+				logSession(jid, force)
+			}
 
 			didFetchNewSession = true
 		}
@@ -753,6 +760,9 @@ const lidCache = new NodeCache({
 
 			await sendNode(stanza)
 		})
+
+		// Log message sent (controlled by BAILEYS_LOG environment variable)
+		logMessage('sent', { messageId: msgId, to: jid })
 
 		return msgId
 	}
