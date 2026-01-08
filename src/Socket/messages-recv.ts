@@ -90,6 +90,9 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	/** Circuit breaker to prevent PreKey error loops */
 	const prekeyCircuitBreaker = createPreKeyCircuitBreaker(logger)
 
+	// Force log to console to ensure visibility in zpro-backend
+	console.log('[BAILEYS] 🔧 Circuit Breaker initialized - Threshold: 5 failures/60s, Timeout: 30s')
+
 	logger.warn(
 		{
 				component: 'CircuitBreaker',
@@ -865,6 +868,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 										},
 										'Circuit breaker is open - skipping retry to prevent loop'
 									)
+								console.log("[BAILEYS] 🔴 Circuit Breaker OPEN - Blocking retry. State: " + stats.state + ", Wait: " + Math.round(stats.timeUntilHalfOpen/1000) + "s")
 									return
 								}
 
@@ -895,6 +899,9 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 									prekeyCircuitBreaker.recordSuccess()
 
 									const cbStats = prekeyCircuitBreaker.getStats()
+
+									// Force log to console to ensure visibility
+									console.log(`[BAILEYS] ✅ Message retry successful - CB State: ${cbStats.state}, Failures: ${cbStats.failures}, RetryCount: ${retryCount}`)
 									logger.warn(
 										{
 											component: 'CircuitBreaker',
